@@ -1,4 +1,4 @@
-# Proxy inled
+# Proxy Inled 
 
 Serverless Function de **Vercel** que sirve los dominios de `inled.es` a través de
 `proxy.inled.es`.
