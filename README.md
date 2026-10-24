@@ -58,6 +58,9 @@ de las aplicaciones). Las relativas y los recursos de terceros no se tocan. Si `
 Y además:
 
 - La cookie del propio proxy (`inled_proxy_origin`) **no se reenvía** al origen.
+- `Referer` y `Origin` del navegador se **reescriben** al origen real (misma ruta, sin
+  nuestros parámetros) o se eliminan si son de un tercero: así no dispara la Protección
+  Hotlink ni validaciones de origen en el servidor.
 - Las `Set-Cookie` del origen con un `Domain=` que el navegador rechazaría desde
   `proxy.inled.es` (p. ej. `Domain=apt.inled.es`, `cf_clearance`) se quedan **host-only**;
   `Domain=inled.es` se conserva tal cual.

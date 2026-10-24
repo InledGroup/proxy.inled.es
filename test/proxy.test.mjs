@@ -74,6 +74,7 @@ test('403 si el destino no es inled.es', async () => {
       makeReq({ query: { url }, headers: { 'x-vercel-ip-country': 'ES' } })
     );
     assert.equal(res.status, 403, `debería bloquear ${url}`);
+    assert.equal(res.headers['x-proxy-error'], 'target-not-allowed', `sin cabecera de error en ${url}`);
   }
 });
 
@@ -110,6 +111,9 @@ test('proxy completo con ES: devuelve status, cabeceras y cuerpo', async () => {
     assert.equal(res.headers['content-type'], 'text/html; charset=utf-8');
     assert.equal(res.headers['x-origen'], 'cloudflare');
     assert.equal(res.headers['access-control-allow-origin'], '*');
+    // Diagnóstico en cabeceras (no visible en el front)
+    assert.equal(res.headers['x-origin-status'], '201');
+    assert.equal(res.headers['x-proxy-by'], 'vercel-proxy-inled');
 
     const seen = stub.calls[0];
     assert.equal(seen.init.headers['host'], 'apt.inled.es');
@@ -363,6 +367,29 @@ test('reescribe también CSS, pero no JSON', async () => {
   }
 });
 
+test('un 403 normal del origen NO se confunde con un desafío (no se enmascara)', async () => {
+  const stub = stubFetch(
+    () =>
+      new Response('<html><head><title>Acceso denegado</title></head><body>403 de la app</body></html>', {
+        status: 403,
+        headers: { server: 'cloudflare', 'content-type': 'text/html; charset=utf-8' },
+      })
+  );
+
+  try {
+    const res = await runHandler(
+      makeReq({ query: { url: 'https://apt.inled.es/app' }, headers: { 'x-vercel-ip-country': 'ES' } })
+    );
+    // Se devuelve el 403 real del origen, sin sustituirlo por la página de error
+    assert.equal(res.status, 403);
+    assert.equal(res.headers['x-origin-status'], '403');
+    assert.equal(res.headers['x-proxy-error'], undefined);
+    assert.match(res.body, /403 de la app/);
+  } finally {
+    stub.restore();
+  }
+});
+
 test('?__origin con ruta de la petición combina origen y ruta', async () => {
   const stub = stubFetch(() => new Response('ok', { status: 200 }));
 
@@ -390,6 +417,68 @@ test('no se permite proxear el propio proxy (bucle)', async () => {
     );
     assert.equal(res.status, 403);
     assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('reescribe Referer y Origin del proxy (evita hotlink y CORS en el origen)', async () => {
+  const stub = stubFetch(() => new Response('ok', { status: 200 }));
+  try {
+    await runHandler(
+      makeReq({
+        method: 'POST',
+        body: '{}',
+        headers: {
+          'x-vercel-ip-country': 'ES',
+          host: 'proxy.inled.es',
+          referer: 'https://proxy.inled.es/pagina?x=1&__origin=https%3A%2F%2Fapt.inled.es',
+          origin: 'https://proxy.inled.es',
+          'content-type': 'application/json',
+        },
+        query: { url: 'https://apt.inled.es/form' },
+      })
+    );
+    const h = stub.calls[0].init.headers;
+    assert.equal(h['referer'], 'https://apt.inled.es/pagina?x=1');
+    assert.equal(h['origin'], 'https://apt.inled.es');
+    assert.ok(!/__origin|proxy\.inled\.es/.test(h['referer']));
+  } finally {
+    stub.restore();
+  }
+});
+
+test('Referer de un tercero no se reenvía al origen', async () => {
+  const stub = stubFetch(() => new Response('ok', { status: 200 }));
+  try {
+    await runHandler(
+      makeReq({
+        query: { url: 'https://apt.inled.es/' },
+        headers: {
+          'x-vercel-ip-country': 'ES',
+          referer: 'https://ejemplo.com/articulo',
+          origin: 'https://ejemplo.com',
+        },
+      })
+    );
+    const h = stub.calls[0].init.headers;
+    assert.equal(h['referer'], undefined);
+    assert.equal(h['origin'], undefined);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('Referer de propio origen inled se conserva tal cual', async () => {
+  const stub = stubFetch(() => new Response('ok', { status: 200 }));
+  try {
+    await runHandler(
+      makeReq({
+        query: { url: 'https://apt.inled.es/' },
+        headers: { 'x-vercel-ip-country': 'ES', referer: 'https://inled.es/blog/entrada' },
+      })
+    );
+    assert.equal(stub.calls[0].init.headers['referer'], 'https://inled.es/blog/entrada');
   } finally {
     stub.restore();
   }
@@ -454,10 +543,10 @@ test('desafío de Cloudflare -> página de diagnóstico, no bucle infinito', asy
         query: { url: 'https://apt.inled.es/app' },
         headers: { 'x-vercel-ip-country': 'ES' },
       })
-    );
-  assert.equal(res.status, 502);
-  assert.match(res.headers['content-type'], /text\/html/);
-  assert.match(res.body, /No se ha podido cargar la página/);
+    );    assert.equal(res.status, 502);
+    assert.equal(res.headers['x-proxy-error'], 'origin-refused');
+    assert.match(res.headers['content-type'], /text\/html/);
+    assert.match(res.body, /No se ha podido cargar la página/);
   // Nada de detalles internos en el front
   assert.ok(!/InledProxy|User-Agent|Cloudflare|WAF|desafío/i.test(res.body), res.body);
   assert.ok(res.body.includes('/?url=' + encodeURIComponent('https://apt.inled.es/app')));

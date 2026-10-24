@@ -251,6 +251,55 @@ function rewriteProxiedUrls(text) {
   );
 }
 
+/**
+ * Cabeceras de identidad del navegador: si apuntan al proxy (o a un tercero),
+ * el origen las vería como hotlink/origen externo. Se reescriben al origen.
+ *  - Referer de proxy -> URL equivalente en el origen (sin nuestros parámetros).
+ *  - Referer de tercero -> se omite (visita directa).
+ *  - Origin del proxy  -> origen real (importante en POST/PUT).
+ */
+function sanitizeIdentityHeaders(req, target) {
+  const proxyHost = String((req.headers && req.headers.host) || '').toLowerCase();
+  const out = {};
+
+  const rawReferer = req.headers.referer || req.headers.referrer;
+  if (rawReferer) {
+    let ref = null;
+    try {
+      ref = new URL(String(rawReferer));
+    } catch {
+      ref = null;
+    }
+    if (ref && ref.host === proxyHost && (ref.protocol === 'https:' || ref.protocol === 'http:')) {
+      // Misma ruta, otro host: quitar nuestros parámetros internos
+      const params = new URLSearchParams(ref.search);
+      params.delete('url');
+      params.delete('__origin');
+      params.delete('path');
+      const q = params.toString();
+      out.referer = `${target.origin}${ref.pathname}${q ? `?${q}` : ''}`;
+    } else if (ref && isAllowedHost(ref.hostname)) {
+      out.referer = ref.toString();
+    }
+    // tercero o ilegible -> sin Referer
+  }
+
+  const rawOrigin = req.headers.origin;
+  if (rawOrigin) {
+    let origin = null;
+    try {
+      origin = new URL(String(rawOrigin));
+    } catch {
+      origin = null;
+    }
+    if (origin && origin.host === proxyHost) out.origin = target.origin;
+    else if (origin && isAllowedHost(origin.hostname)) out.origin = origin.origin;
+    // tercero -> sin Origin
+  }
+
+  return out;
+}
+
 /** La cookie del propio proxy no debe reenviarse al origen. */
 function stripOwnCookie(cookieHeader) {
   if (!cookieHeader) return cookieHeader;
@@ -276,30 +325,34 @@ function normalizeSetCookie(cookie) {
 
 /** ¿La respuesta es un desafío de Cloudflare que el navegador no puede completar? */
 function isCloudflareChallenge(response, payload) {
-  const mitigated = String(response.headers.get('cf-mitigated') || '').toLowerCase();
-  if (mitigated === 'challenge') return true;
-  if (response.status !== 403 && response.status !== 503) return false;
-  const server = String(response.headers.get('server') || '').toLowerCase();
-  if (!server.includes('cloudflare')) return false;
-  if (!payload || !payload.length) return false;
-  const head = payload.subarray(0, 8192).toString('utf8');
-  return /<title>Just a moment|cf-browser-verification|challenge-platform/i.test(head);
+  // Cabecera explícita de Cloudflare (fuente fiable)
+  if (String(response.headers.get('cf-mitigated') || '').toLowerCase() === 'challenge') return true;
+  // Página "Just a moment..." (solo si el título es ese, para no falsear positivos)
+  if (response.status === 403 || response.status === 503) {
+    if (payload && payload.length) {
+      const head = payload.subarray(0, 8192).toString('utf8');
+      if (/<title>Just a moment\.\.\.<\/title>/i.test(head)) return true;
+    }
+  }
+  return false;
 }
 
 const CORS_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS';
 
-function sendText(res, status, message) {
+function sendText(res, status, message, errorCode) {
   const payload = Buffer.from(String(message), 'utf8');
   res.statusCode = status;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  if (errorCode) res.setHeader('X-Proxy-Error', errorCode);
   res.setHeader('Content-Length', String(payload.length));
   res.end(payload);
 }
 
-function sendHtml(res, status, html) {
+function sendHtml(res, status, html, errorCode) {
   const payload = Buffer.from(String(html), 'utf8');
   res.statusCode = status;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  if (errorCode) res.setHeader('X-Proxy-Error', errorCode);
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Length', String(payload.length));
   res.end(payload);
@@ -341,6 +394,12 @@ function buildRequestHeaders(req, target) {
     if (withoutOurs) headers['cookie'] = withoutOurs;
     else delete headers['cookie'];
   }
+
+  // Referer/Origin: nunca deben parecer un hotlink externo para el origen
+  delete headers['referer'];
+  delete headers['referrer'];
+  delete headers['origin'];
+  Object.assign(headers, sanitizeIdentityHeaders(req, target));
 
   // Evitamos compresión del origen: fetch() decodifica el cuerpo y reenviar
   // content-encoding original rompería la respuesta.
@@ -406,7 +465,7 @@ export default async function handler(req, res) {
   const resolved = resolveTarget(req);
 
   if (resolved.error === 'forbidden') {
-    sendText(res, 403, 'Solo se permite el proxy hacia dominios inled.es.');
+    sendText(res, 403, 'Solo se permite el proxy hacia dominios inled.es.', 'target-not-allowed');
     return;
   }
 
@@ -436,10 +495,12 @@ export default async function handler(req, res) {
       redirect: 'manual',
     });
   } catch (err) {
+    console.error('[proxy] error de conexión', req.method, target.toString(), err && err.message);
     sendText(
       res,
       502,
-      'No se pudo conectar con el destino: ' + (err && err.message ? err.message : 'error')
+      'No se pudo conectar con el destino: ' + (err && err.message ? err.message : 'error'),
+      'origin-unreachable'
     );
     return;
   }
@@ -466,7 +527,7 @@ export default async function handler(req, res) {
       next = null;
     }
     if (!next || !isAllowedHost(next.hostname)) {
-      sendText(res, 403, 'El destino redirigido no pertenece a inled.es.');
+      sendText(res, 403, 'El destino redirigido no pertenece a inled.es.', 'redirect-not-allowed');
       return;
     }
     outHeaders.location = proxiedLocation(next);
@@ -481,7 +542,8 @@ export default async function handler(req, res) {
   // Desafío o error del origen: el navegador no puede resolverlo a través
   // del proxy, así que devolvemos un aviso genérico en vez de un bucle.
   if (isCloudflareChallenge(response, payload)) {
-    sendHtml(res, 502, renderChallenge({ host: target.host, url: target.toString() }));
+    console.warn('[proxy] el origen devolvió un desafío', target.toString(), response.status);
+    sendHtml(res, 502, renderChallenge({ host: target.host, url: target.toString() }), 'origin-refused');
     return;
   }
 
@@ -520,6 +582,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Expose-Headers', '*');
   res.setHeader('X-Proxy-By', 'vercel-proxy-inled');
+  res.setHeader('X-Origin-Status', String(status));
   if (outBody) res.setHeader('Content-Length', String(outBody.length));
   else if (req.method === 'HEAD' && originContentLength) {
     res.setHeader('Content-Length', originContentLength);
@@ -527,4 +590,8 @@ export default async function handler(req, res) {
 
   if (outBody === null) res.end();
   else res.end(outBody);
+
+  if (status >= 400) {
+    console.warn('[proxy] origen', status, target.toString());
+  }
 }
