@@ -74,7 +74,12 @@ Toda respuesta lleva cabeceras de ayuda para depurar sin mirar el front:
 |---|---|
 | `X-Proxy-By` | La ha servido esta función. |
 | `X-Origin-Status` | Status real devuelto por el origen. |
+| `X-Origin-Flag` | Motivo del aviso mostrado (`challenge-header`, `challenge-title`). |
 | `X-Proxy-Error` | `target-not-allowed`, `redirect-not-allowed`, `origin-unreachable`, `origin-refused`. |
+
+Si el origen responde con algo que el navegador no podría completar por su cuenta, el
+proxy **reintenta una vez** con cabeceras mínimas (sin cookies ni marcas de contexto del
+navegador) antes de mostrar la página de aviso.
 
 Los eventos también se imprimen en los logs de la función (`[proxy] ...`).
 

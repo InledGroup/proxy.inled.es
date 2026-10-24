@@ -308,13 +308,25 @@ function sanitizeIdentityHeaders(req, target) {
   return out;
 }
 
-/** La cookie del propio proxy no debe reenviarse al origen. */
+/**
+ * Cookies que se limpian antes de enviarlas al origen:
+ *  - la nuestra (`inled_proxy_origin`), que es interna del proxy.
+ *  - las de navegador que quedan ligadas a la IP/fingerprint del cliente
+ *    (`cf_clearance`, `__cf_bm`...): reenviadas desde Vercel no coinciden y
+ *    el origen acaba exigiendo un reto.
+ */
 function stripOwnCookie(cookieHeader) {
   if (!cookieHeader) return cookieHeader;
   const kept = String(cookieHeader)
     .split(';')
     .map((part) => part.trim())
-    .filter((part) => part.split('=')[0].trim() !== ORIGIN_COOKIE);
+    .filter((part) => {
+      const name = part.split('=')[0].trim();
+      if (name === ORIGIN_COOKIE) return false;
+      if (/^(?:cf_clearance|__cf_bm|__cflb|_cfuvid)$/i.test(name)) return false;
+      if (/^cf_chl_/i.test(name)) return false;
+      return true;
+    });
   return kept.length ? kept.join('; ') : '';
 }
 
@@ -332,35 +344,47 @@ function normalizeSetCookie(cookie) {
 }
 
 /** ¿El origen ha devuelto algo que el navegador no puede completar vía proxy? */
-function isUpstreamChallenge(response, payload) {
+function upstreamChallengeReason(response, payload) {
   // Cabecera explícita del propio origen (fuente fiable)
-  if (String(response.headers.get('cf-mitigated') || '').toLowerCase() === 'challenge') return true;
+  if (String(response.headers.get('cf-mitigated') || '').toLowerCase() === 'challenge') {
+    return 'challenge-header';
+  }
   // Página "Just a moment..." (solo si el título es ese, para no falsear positivos)
   if (response.status === 403 || response.status === 503) {
     if (payload && payload.length) {
       const head = payload.subarray(0, 8192).toString('utf8');
-      if (/<title>Just a moment\.\.\.<\/title>/i.test(head)) return true;
+      if (/<title>Just a moment\.\.\.<\/title>/i.test(head)) return 'challenge-title';
     }
   }
-  return false;
+  return null;
 }
 
 const CORS_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS';
 
-function sendText(res, status, message, errorCode) {
+function setExtraHeaders(res, extra) {
+  for (const [name, value] of Object.entries(extra || {})) {
+    try {
+      res.setHeader(name, value);
+    } catch {
+      /* cabecera descartada */
+    }
+  }
+}
+
+function sendText(res, status, message, extra) {
   const payload = Buffer.from(String(message), 'utf8');
   res.statusCode = status;
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  if (errorCode) res.setHeader('X-Proxy-Error', errorCode);
+  setExtraHeaders(res, extra);
   res.setHeader('Content-Length', String(payload.length));
   res.end(payload);
 }
 
-function sendHtml(res, status, html, errorCode) {
+function sendHtml(res, status, html, extra) {
   const payload = Buffer.from(String(html), 'utf8');
   res.statusCode = status;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  if (errorCode) res.setHeader('X-Proxy-Error', errorCode);
+  setExtraHeaders(res, extra);
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Length', String(payload.length));
   res.end(payload);
@@ -374,13 +398,21 @@ function sendRedirect(res, status, location) {
 }
 
 /** Cabeceras de la petición original reenviadas al destino (con Host correcto). */
-function buildRequestHeaders(req, target) {
+function buildRequestHeaders(req, target, options = {}) {
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const name = key.toLowerCase();
     if (HOP_BY_HOP.has(name) || CLIENT_MANAGED.has(name)) continue;
     if (value === undefined) continue;
     headers[name] = Array.isArray(value) ? value.join(', ') : value;
+  }
+
+  // Reintento "limpio": nada de cookies ni cabeceras de contexto del navegador
+  if (options.dropBrowserHeaders) {
+    delete headers['cookie'];
+    for (const name of Object.keys(headers)) {
+      if (name.startsWith('sec-fetch-') || name.startsWith('sec-ch-ua')) delete headers[name];
+    }
   }
 
   // Host de la infraestructura de destino y encadenado de proxies
@@ -472,7 +504,9 @@ export default async function handler(req, res) {
   const resolved = resolveTarget(req);
 
   if (resolved.error === 'forbidden') {
-    sendText(res, 403, 'Solo se permite el proxy hacia dominios inled.es.', 'target-not-allowed');
+    sendText(res, 403, 'Solo se permite el proxy hacia dominios inled.es.', {
+      'X-Proxy-Error': 'target-not-allowed',
+    });
     return;
   }
 
@@ -492,24 +526,54 @@ export default async function handler(req, res) {
 
   // 3) Desde España -> proxy completo desde la infraestructura de Vercel
   const body = await readRequestBody(req);
+  const sendBody = body && req.method !== 'HEAD' ? new Uint8Array(body) : undefined;
+  const fetchInit = (headers) => ({
+    method: req.method,
+    headers,
+    body: sendBody,
+    redirect: 'manual',
+  });
+  const readPayload = (resp) =>
+    resp.status === 204 || resp.status === 304 || req.method === 'HEAD'
+      ? Promise.resolve(null)
+      : resp.arrayBuffer().then((buf) => Buffer.from(buf));
 
   let response;
   try {
-    response = await fetch(target, {
-      method: req.method,
-      headers: buildRequestHeaders(req, target),
-      body: body && req.method !== 'HEAD' ? new Uint8Array(body) : undefined,
-      redirect: 'manual',
-    });
+    response = await fetch(target, fetchInit(buildRequestHeaders(req, target)));
   } catch (err) {
     console.error('[proxy] error de conexión', req.method, target.toString(), err && err.message);
     sendText(
       res,
       502,
       'No se pudo conectar con el destino: ' + (err && err.message ? err.message : 'error'),
-      'origin-unreachable'
+      { 'X-Proxy-Error': 'origin-unreachable' }
     );
     return;
+  }
+
+  let payload = await readPayload(response);
+
+  // Si el origen exige un reto, reintentamos UNA vez con cabeceras mínimas:
+  // sin cookies ni marcas de contexto del navegador, que suelen ser el detonante.
+  if (upstreamChallengeReason(response, payload)) {
+    console.warn(
+      '[proxy] desafío del origen, reintento limpio',
+      target.toString(),
+      response.status,
+      upstreamChallengeReason(response, payload)
+    );
+    try {
+      const retryResponse = await fetch(
+        target,
+        fetchInit(buildRequestHeaders(req, target, { dropBrowserHeaders: true }))
+      );
+      const retryPayload = await readPayload(retryResponse);
+      response = retryResponse;
+      payload = retryPayload;
+    } catch (err) {
+      console.warn('[proxy] reintento limpio fallido', err && err.message);
+    }
   }
 
   // Cabeceras de la respuesta del destino
@@ -534,23 +598,32 @@ export default async function handler(req, res) {
       next = null;
     }
     if (!next || !isAllowedHost(next.hostname)) {
-      sendText(res, 403, 'El destino redirigido no pertenece a inled.es.', 'redirect-not-allowed');
+      sendText(res, 403, 'El destino redirigido no pertenece a inled.es.', {
+        'X-Proxy-Error': 'redirect-not-allowed',
+      });
       return;
     }
     outHeaders.location = proxiedLocation(next);
   }
 
   const status = response.status;
-  const payload =
-    status === 204 || status === 304 || req.method === 'HEAD'
-      ? null
-      : Buffer.from(await response.arrayBuffer());
+
+  const challengeReason = upstreamChallengeReason(response, payload);
 
   // El origen ha respondido con algo que el navegador no puede completar a
   // través del proxy: aviso genérico en vez de un bucle.
-  if (isUpstreamChallenge(response, payload)) {
-    console.warn('[proxy] el origen devolvió un desafío', target.toString(), response.status);
-    sendHtml(res, 502, renderChallenge({ host: target.host, url: target.toString() }), 'origin-refused');
+  if (challengeReason) {
+    console.warn(
+      '[proxy] el origen devolvió un desafío',
+      target.toString(),
+      response.status,
+      challengeReason
+    );
+    sendHtml(res, 502, renderChallenge({ host: target.host, url: target.toString() }), {
+      'X-Proxy-Error': 'origin-refused',
+      'X-Origin-Status': String(response.status),
+      'X-Origin-Flag': challengeReason,
+    });
     return;
   }
 

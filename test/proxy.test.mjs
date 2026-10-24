@@ -424,6 +424,55 @@ test('no se permite proxear el propio proxy (bucle)', async () => {
   }
 });
 
+test('si el primer intento recibe reto y el limpio pasa, se sirve la respuesta', async () => {
+  const original = globalThis.fetch;
+  const calls = [];
+  let n = 0;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    n += 1;
+    if (n === 1) {
+      return new Response('<html><head><title>Just a moment...</title></head></html>', {
+        status: 403,
+        headers: { server: 'cloudflare', 'content-type': 'text/html; charset=utf-8' },
+      });
+    }
+    return new Response('<html><body>ok limpio</body></html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  };
+
+  try {
+    const res = await runHandler(
+      makeReq({
+        query: { url: 'https://apt.inled.es/panel' },
+        headers: {
+          'x-vercel-ip-country': 'ES',
+          cookie: 'cf_clearance=abc; sesion=1',
+          referer: 'https://proxy.inled.es/panel',
+          'sec-fetch-site': 'same-origin',
+          'sec-fetch-mode': 'navigate',
+        },
+      })
+    );
+
+    assert.equal(res.status, 200);
+    assert.match(res.body, /ok limpio/);
+    assert.equal(calls.length, 2, 'debe reintentar una sola vez');
+    // Primera petición: ya sin cookies de navegador atadas al cliente
+    assert.equal(calls[0].init.headers['cookie'], 'sesion=1');
+    // Reintento: sin cookies ni cabeceras de contexto
+    assert.equal(calls[1].init.headers['cookie'], undefined);
+    assert.equal(calls[1].init.headers['sec-fetch-site'], undefined);
+    assert.equal(calls[1].init.headers['referer'], 'https://apt.inled.es/panel');
+    assert.equal(calls[0].init.headers['referer'], 'https://apt.inled.es/panel');
+    assert.equal(calls[1].init.headers['user-agent'], PROXY_USER_AGENT);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 test('reescribe Referer y Origin del proxy (evita hotlink y CORS en el origen)', async () => {
   const stub = stubFetch(() => new Response('ok', { status: 200 }));
   try {
@@ -547,6 +596,15 @@ test('desafío de Cloudflare -> página de diagnóstico, no bucle infinito', asy
       })
     );    assert.equal(res.status, 502);
     assert.equal(res.headers['x-proxy-error'], 'origin-refused');
+    // El origen ya ha reintentado una vez y sigue exigiendo el reto
+    assert.equal(stub.calls.length, 2);
+    // El reintento va sin cookies ni marcas de contexto del navegador
+    assert.equal(stub.calls[1].init.headers['cookie'], undefined);
+    assert.equal(stub.calls[1].init.headers['sec-fetch-site'], undefined);
+    assert.equal(stub.calls[1].init.headers['user-agent'], PROXY_USER_AGENT);
+    // Diagnóstico: qué status y qué motivo ha dado el origen
+    assert.equal(res.headers['x-origin-status'], '403');
+    assert.equal(res.headers['x-origin-flag'], 'challenge-header');
     assert.match(res.headers['content-type'], /text\/html/);
     assert.match(res.body, /No se ha podido cargar la página/);
   // Nada de detalles internos en el front
