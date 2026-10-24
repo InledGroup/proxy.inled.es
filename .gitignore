@@ -1,3 +1,6 @@
+# Notas privadas de operación (nunca subir)
+NOTAS-OPERACION.md
+
 node_modules/
 .vercel/
 .env

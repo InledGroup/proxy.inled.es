@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import handler from '../api/proxy.js';
+import handler, { PROXY_USER_AGENT } from '../api/proxy.js';
 
 const ORIGIN_COOKIE = 'inled_proxy_origin';
 
@@ -64,7 +64,8 @@ test('sin parámetro url ni cookie -> landing page', async () => {
   assert.match(res.body, /INLED/);
   assert.match(res.body, /name="url"/);
   // La landing no explica nada interno: solo input y formato
-  assert.ok(!/InledProxy|User-Agent|Cloudflare|WAF|cookie|país/i.test(res.body), res.body);
+  assert.ok(!res.body.includes(PROXY_USER_AGENT), res.body);
+  assert.ok(!/User-Agent|Cloudflare|WAF|cookie|país/i.test(res.body), res.body);
   assert.match(res.body, /\?url=https:\/\/apt\.inled\.es/);
 });
 
@@ -118,7 +119,8 @@ test('proxy completo con ES: devuelve status, cabeceras y cuerpo', async () => {
     const seen = stub.calls[0];
     assert.equal(seen.init.headers['host'], 'apt.inled.es');
     // El User-Agent del cliente se sustituye por el del proxy
-    assert.equal(seen.init.headers['user-agent'], 'InledProxy/1.0');
+    assert.equal(seen.init.headers['user-agent'], PROXY_USER_AGENT);
+    assert.match(PROXY_USER_AGENT, /^[A-Za-z][A-Za-z-]*\/\d+\.\d+$/);
     assert.equal(seen.init.headers['x-forwarded-host'], 'proxy.inled.es');
     assert.equal(seen.init.headers['x-forwarded-proto'], 'https');
     assert.ok(seen.init.headers['x-forwarded-for'].includes('203.0.113.10'));
@@ -548,7 +550,8 @@ test('desafío de Cloudflare -> página de diagnóstico, no bucle infinito', asy
     assert.match(res.headers['content-type'], /text\/html/);
     assert.match(res.body, /No se ha podido cargar la página/);
   // Nada de detalles internos en el front
-  assert.ok(!/InledProxy|User-Agent|Cloudflare|WAF|desafío/i.test(res.body), res.body);
+  assert.ok(!res.body.includes(PROXY_USER_AGENT), res.body);
+  assert.ok(!/User-Agent|Cloudflare|WAF|desafío/i.test(res.body), res.body);
   assert.ok(res.body.includes('/?url=' + encodeURIComponent('https://apt.inled.es/app')));
   } finally {
     stub.restore();

@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import handler from '../api/proxy.js';
+import handler, { PROXY_USER_AGENT } from '../api/proxy.js';
 
 const ORIGIN_PORT = 8099;
 const PROXY_PORT = 8100;
@@ -117,7 +117,7 @@ test('proxy end-to-end: devuelve status, cabeceras y cuerpo del origen', async (
   // La petición llegó al origen con el Host correcto y los encadenados de Vercel
   const seen = originRequests.at(-1);
   assert.equal(seen.headers.host, `127.0.0.1:${ORIGIN_PORT}`);
-  assert.equal(seen.headers['user-agent'], 'InledProxy/1.0');
+  assert.equal(seen.headers['user-agent'], PROXY_USER_AGENT);
   assert.equal(seen.headers['x-forwarded-host'], 'proxy.inled.es');
   assert.equal(seen.headers['x-forwarded-proto'], 'https');
   assert.ok(seen.headers['x-forwarded-for'].includes('198.51.100.7'));
