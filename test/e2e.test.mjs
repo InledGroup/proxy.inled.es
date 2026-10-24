@@ -33,6 +33,15 @@ before(async () => {
         res.writeHead(302, { Location: 'https://otro.dominio.com/' });
         return res.end();
       }
+      if (req.url.startsWith('/app/page')) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(
+          '<html><head><link rel="stylesheet" href="https://apt.inled.es/css/a.css"></head>' +
+            '<body><a href="https://apt.inled.es/otra?x=1">ir</a>' +
+            '<img src="//apt.inled.es/img.png"></body></html>'
+        );
+        return;
+      }
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'X-Origin': 'cloudflare-inled',
@@ -88,6 +97,8 @@ test('landing: sin ?url= ni cookie devuelve la página de uso', async () => {
   assert.match(html, /Proxy inled/);
   assert.match(html, /name="url"/);
   assert.match(html, /Licenciado bajo MIT-INLED/);
+  // El logo se sirve a través del proxy, no directo a hosted.inled.es
+  assert.match(html, /src="\/api\/proxy\?url=https%3A%2F%2Fhosted\.inled\.es%2Fcdn%2F/);
   assert.equal(originRequests.length, 0, 'no debe tocar el origen');
 });
 
@@ -130,6 +141,19 @@ test('proxy end-to-end: navegación interna con cookie y ruta relativa', async (
   const asset = await go('/css/site.css?v=5', { headers: { cookie } });
   assert.equal(asset.status, 200);
   assert.equal(originRequests.at(-1).url, '/css/site.css?v=5');
+});
+
+test('proxy end-to-end: HTML reescrito y Content-Length correcto', async () => {
+  originRequests = [];
+  const cookie = `${ORIGIN_COOKIE}=${encodeURIComponent('https://apt.inled.es')}`;
+  const res = await go('/app/page', { headers: { cookie } });
+
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.ok(text.includes('href="/otra?__origin=https%3A%2F%2Fapt.inled.es&x=1"'), text);
+  assert.ok(text.includes('src="/img.png?__origin=https%3A%2F%2Fapt.inled.es"'), text);
+  // Si el Content-Length no cuadra con el cuerpo reescrito, fetch() fallaría aquí
+  assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(text));
 });
 
 test('proxy end-to-end: POST reenvía el cuerpo', async () => {

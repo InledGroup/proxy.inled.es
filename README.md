@@ -39,6 +39,38 @@ formularios con URL relativa) resuelven su ruta contra ese origen:
 La ruta original la manda `vercel.json` a la función mediante el rewrite
 `/(.*)` → `/api/proxy?path=$1`.
 
+### Reescritura de contenido (nada escapa al origen)
+
+Las respuestas `text/html`, `text/css` y `javascript` (UTF-8, hasta 5 MB) se reescriben
+**en el servidor** para que el navegador no pida nada directamente al origen con su
+propio User-Agent (que es lo que Cloudflare sigue desafiando):
+
+```
+https://apt.inled.es/ruta?x=1   ->  /ruta?__origin=https%3A%2F%2Fapt.inled.es&x=1
+//apt.inled.es/img.png          ->  /img.png?__origin=https%3A%2F%2Fapt.inled.es
+```
+
+Se reescriben `href`, `src`, `srcset`, `action`, `<base>`, `url()` de CSS, meta refresh y
+cualquier URL absoluta o `//` hacia `*.inled.es` en HTML/CSS/JS (incluidos los `fetch()`
+de las aplicaciones). Las relativas y los recursos de terceros no se tocan. Si `?url=` o
+`?__origin=` no traen ruta propia, se combina con la ruta de la petición.
+
+Y además:
+
+- La cookie del propio proxy (`inled_proxy_origin`) **no se reenvía** al origen.
+- Las `Set-Cookie` del origen con un `Domain=` que el navegador rechazaría desde
+  `proxy.inled.es` (p. ej. `Domain=apt.inled.es`, `cf_clearance`) se quedan **host-only**;
+  `Domain=inled.es` se conserva tal cual.
+- Nunca se permite proxear el propio host (evita bucles).
+
+### Si el origen devuelve un desafío de Cloudflare
+
+Si la respuesta trae `cf-mitigated: challenge` (o un `403/503` de Cloudflare con la
+página "Just a moment"), el navegador **no puede completar el reto a través del proxy**.
+En vez de dejar un bucle infinito, el proxy devuelve una **página de diagnóstico (502)**
+con la checklist: regla *Skip* con prioridad alta, Bot Fight Mode, Super Bot Fight Mode,
+eventos en *Security → Events* y prueba en incógnito.
+
 ### User-Agent del proxy
 
 Todas las peticiones al origen salen identificadas con:
@@ -69,20 +101,21 @@ desactivarlo para ese hostname (`Security → Bots → Bot Fight Mode`).
 
 ### Limitaciones conocidas
 
-- **No se reescribe el HTML**: los enlaces y recursos con URL **absoluta** al origen
-  (por ejemplo `<img src="https://apt.inled.es/foto.png">`) se piden directamente al
-  origen y **no pasan por el proxy**. Los relativos sí.
-- Las cookies del origen se reenvían tal cual; si el origen emite
-  `Domain=apt.inled.es`, el navegador las rechaza porque la respuesta viene de
-  `proxy.inled.es` (funciona con `Domain=inled.es` o sin `Domain`).
-- Las redirecciones del origen se devuelven al cliente con `Location` reescrito para
-  que el siguiente salto vuelva a pasar por el proxy; si apunta fuera de `inled.es`, `403`.
+- Las URLs absolutas dentro de **JSON** (`application/json`) no se reescriben, ni las
+  comparaciones de *cadenas* en JS (`x === "https://apt.inled.es"`), que se romperían.
+  Un `fetch()` con URL absoluta en JS **sí** se reescribe.
+- Las `Set-Cookie` con `Domain=` que no sea `inled.es`/`proxy.inled.es` se reenvían sin
+  atributo Domain (host-only para el proxy), para que el navegador no las descarte.
+- Si el origen redirige (o meta-refresh) hacia un dominio ajeno a `inled.es`, el proxy
+  devuelve `403`.
+- Las redirecciones internas del origen se devuelven con `Location` reescrito para que
+  el siguiente salto vuelva a pasar por el proxy.
 
 ## Estructura
 
 ```
-api/proxy.js      # la función proxy (país, allowlist, cookies, landing)
-lib/landing.js    # página HTML de uso (sin build)
+api/proxy.js      # la función proxy (país, allowlist, cookies, reescritura, landing)
+lib/landing.js    # landing + página de diagnóstico (HTML plano, sin build)
 vercel.json       # rewrite de ruta + maxDuration
 test/             # tests unitarios y end-to-end (npm test)
 ```
@@ -150,5 +183,6 @@ El `User-Agent: InledProxy/1.0` saliente se ve en los logs de Cloudflare del ori
 npm test
 ```
 
-21 tests: unitarios (allowlist, país, cookies, rutas, POST, CORS) y end-to-end sobre
-HTTP real (servidor de origen local, simulando el rewrite de `vercel.json`).
+29 tests: unitarios (allowlist, país, cookies, rutas, reescritura de HTML/CSS/JS,
+antibucle, cookies con Domain, desafío CF, POST, CORS) y end-to-end sobre HTTP real
+(servidor de origen local, simulando el rewrite de `vercel.json`).

@@ -285,3 +285,179 @@ test('OPTIONS responde 204 con CORS', async () => {
   assert.equal(res.status, 204);
   assert.equal(res.headers['access-control-allow-origin'], '*');
 });
+
+test('reescribe en HTML todas las URLs absolutas del origen (nada escapa al CF)', async () => {
+  const html = `<!doctype html><html><head>
+<link rel="stylesheet" href="https://apt.inled.es/css/site.css">
+<link rel="stylesheet" href="https://fonts.googleapis.com/x.css">
+<link rel="stylesheet" href="/rel.css">
+<link rel="stylesheet" href="//apt.inled.es/proto.css">
+<base href="https://apt.inled.es/app/">
+</head><body>
+<a href="https://apt.inled.es/ruta?x=1&amp;y=2">ir</a>
+<img src="https://inled.es/logo.png" srcset="https://apt.inled.es/a.png 1x, https://apt.inled.es/b.png 2x">
+<script src="https://apt.inled.es/app.js"></script>
+<script>fetch('https://apt.inled.es/api/datos')</script>
+</body></html>`;
+  const stub = stubFetch(
+    () => new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+  );
+
+  try {
+    const res = await runHandler(
+      makeReq({ query: { url: 'https://apt.inled.es/app/' }, headers: { 'x-vercel-ip-country': 'ES' } })
+    );
+    assert.equal(res.status, 200);
+    const body = res.body;
+    const O = '__origin=https%3A%2F%2Fapt.inled.es';
+
+    // Absolutas del origen -> ruta del proxy con el origen marcado
+    assert.ok(body.includes(`href="/css/site.css?${O}"`), 'css absoluto');
+    assert.ok(body.includes(`href="/proto.css?${O}"`), 'protocol-relative');
+    assert.ok(body.includes(`href="/app/?__origin=https%3A%2F%2Fapt.inled.es"`), 'base');
+    assert.ok(body.includes(`href="/ruta?${O}&x=1&amp;y=2"`), 'ancla con query');
+    assert.ok(body.includes(`src="/logo.png?__origin=https%3A%2F%2Finled.es"`), 'host inled.es');
+    assert.ok(body.includes(`/a.png?${O} 1x`), 'srcset');
+    assert.ok(body.includes(`/b.png?${O} 2x`), 'srcset 2');
+    assert.ok(body.includes(`/api/datos?${O}`), 'fetch en JS');
+
+    // Relativas y terceros intactos
+    assert.ok(body.includes('href="/rel.css"'), 'relativa intacta');
+    assert.ok(body.includes('href="https://fonts.googleapis.com/x.css"'), 'tercero intacto');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('reescribe también CSS, pero no JSON', async () => {
+  const stub = stubFetch((url) =>
+    url.includes('hoja')
+      ? new Response('body{background:url(https://apt.inled.es/img/bg.png)}', {
+          status: 200,
+          headers: { 'content-type': 'text/css' },
+        })
+      : new Response('{"url":"https://apt.inled.es/x"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+  );
+
+  try {
+    const css = await runHandler(
+      makeReq({ query: { url: 'https://apt.inled.es/hoja' }, headers: { 'x-vercel-ip-country': 'ES' } })
+    );
+    assert.ok(
+      css.body.includes('url(/img/bg.png?__origin=https%3A%2F%2Fapt.inled.es)'),
+      'url() de CSS reescrita'
+    );
+
+    const json = await runHandler(
+      makeReq({ query: { url: 'https://apt.inled.es/api' }, headers: { 'x-vercel-ip-country': 'ES' } })
+    );
+    assert.equal(json.body, '{"url":"https://apt.inled.es/x"}', 'JSON intacto');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('?__origin con ruta de la petición combina origen y ruta', async () => {
+  const stub = stubFetch(() => new Response('ok', { status: 200 }));
+
+  try {
+    await runHandler(
+      makeReq({
+        query: { path: 'panel', __origin: 'https://apt.inled.es', page: '2' },
+        headers: { 'x-vercel-ip-country': 'ES' },
+      })
+    );
+    assert.equal(stub.calls[0].url, 'https://apt.inled.es/panel?page=2');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('no se permite proxear el propio proxy (bucle)', async () => {
+  const stub = stubFetch(() => new Response('ok', { status: 200 }));
+  try {
+    const res = await runHandler(
+      makeReq({
+        query: { url: 'https://proxy.inled.es/algo' },
+        headers: { 'x-vercel-ip-country': 'ES' },
+      })
+    );
+    assert.equal(res.status, 403);
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('no reenvía la cookie de sesión del proxy al origen', async () => {
+  const stub = stubFetch(() => new Response('ok', { status: 200 }));
+  try {
+    await runHandler(
+      makeReq({
+        query: { url: 'https://apt.inled.es/' },
+        headers: {
+          'x-vercel-ip-country': 'ES',
+          cookie: `inled_proxy_origin=${encodeURIComponent('https://apt.inled.es')}; sesion=abc`,
+        },
+      })
+    );
+    assert.equal(stub.calls[0].init.headers['cookie'], 'sesion=abc');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('limpia el Domain de cookies que el navegador rechazaría', async () => {
+  const originHeaders = new Headers();
+  originHeaders.append('set-cookie', 'sesion=1; Path=/; Domain=apt.inled.es; HttpOnly');
+  originHeaders.append('set-cookie', 'prefs=2; Path=/; Domain=inled.es');
+  originHeaders.append('set-cookie', 'hostonly=3; Path=/');
+  const stub = stubFetch(() => new Response('ok', { status: 200, headers: originHeaders }));
+
+  try {
+    const res = await runHandler(
+      makeReq({ query: { url: 'https://apt.inled.es/' }, headers: { 'x-vercel-ip-country': 'ES' } })
+    );
+    const cookies = [].concat(res.headers['set-cookie']);
+    const sesion = cookies.find((c) => c.startsWith('sesion=1'));
+    assert.ok(sesion && !/domain=/i.test(sesion), `Domain inútil no eliminada: ${sesion}`);
+    assert.ok(sesion.includes('HttpOnly'));
+    assert.ok(cookies.some((c) => /Domain=inled\.es/i.test(c)), 'Domain=inled.es se conserva');
+    assert.ok(cookies.some((c) => c.startsWith('hostonly=3')));
+  } finally {
+    stub.restore();
+  }
+});
+
+test('desafío de Cloudflare -> página de diagnóstico, no bucle infinito', async () => {
+  const stub = stubFetch(
+    () =>
+      new Response('<html><head><title>Just a moment...</title></head></html>', {
+        status: 403,
+        headers: {
+          'cf-mitigated': 'challenge',
+          server: 'cloudflare',
+          'content-type': 'text/html; charset=utf-8',
+        },
+      })
+  );
+
+  try {
+    const res = await runHandler(
+      makeReq({
+        query: { url: 'https://apt.inled.es/app' },
+        headers: { 'x-vercel-ip-country': 'ES' },
+      })
+    );
+    assert.equal(res.status, 502);
+    assert.match(res.headers['content-type'], /text\/html/);
+    assert.match(res.body, /Desafío de Cloudflare/);
+    assert.match(res.body, /InledProxy\/1\.0/);
+    assert.ok(res.body.includes('/?url=' + encodeURIComponent('https://apt.inled.es/app')));
+  } finally {
+    stub.restore();
+  }
+});

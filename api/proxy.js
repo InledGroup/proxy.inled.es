@@ -18,12 +18,20 @@
  *  4. Sin destino resoluble -> landing page de uso.
  */
 
-import { renderLanding } from '../lib/landing.js';
+import { renderLanding, renderChallenge } from '../lib/landing.js';
 
 const DOMAIN = 'inled.es';
 
 /** User-Agent con el que el proxy pide al origen (autorizable en Cloudflare). */
 const PROXY_USER_AGENT = 'InledProxy/1.0';
+
+/** Parámetro con el que se marca el origen en los enlaces reescritos. */
+const ORIGIN_PARAM = '__origin';
+
+/** Tipos de contenido cuyo cuerpo se reescribe para que no escape al origen. */
+const REWRITABLE_TYPE = /(?:text\/html|application\/xhtml\+xml|text\/css|javascript|ecmascript)/i;
+const UTF8_CHARSET = /^(?:utf-?8|us-ascii|ascii|unicode|)$/i;
+const MAX_REWRITE_BYTES = 5 * 1024 * 1024;
 
 /** Cookie que recuerda el origen de la sesión proxificada. */
 const ORIGIN_COOKIE = 'inled_proxy_origin';
@@ -144,7 +152,7 @@ function toRelativePath(pathname) {
 function forwardedSearch(req) {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(req.query || {})) {
-    if (key === 'path' || key === 'url') continue;
+    if (key === 'path' || key === 'url' || key === ORIGIN_PARAM) continue;
     for (const item of [].concat(value)) {
       if (item !== undefined && item !== null) params.append(key, String(item));
     }
@@ -152,33 +160,130 @@ function forwardedSearch(req) {
   return params.toString();
 }
 
+/** Combina el origen con la ruta pedida por el navegador. */
+function buildTarget(origin, pathParam, search) {
+  try {
+    const rel = toRelativePath(pathParam);
+    return new URL(search ? `${rel}?${search}` : rel, origin);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resuelve qué destino toca.
- *  - con ?url= -> ese dominio (validado).
- *  - sin ?url= -> origen guardado en cookie + ruta de la petición.
+ *  - con ?url= (o ?__origin=) -> ese origen; si no trae ruta propia, se le
+ *    suma la ruta que pidió el navegador (así los enlaces reescritos funcionan).
+ *  - sin parámetros -> origen guardado en cookie + ruta de la petición.
  */
 function resolveTarget(req) {
   const q = req.query || {};
-  const rawUrl = firstValue(q.url) || rawQueryParam(req, 'url');
+  const raw =
+    firstValue(q.url) ||
+    rawQueryParam(req, 'url') ||
+    firstValue(q[ORIGIN_PARAM]) ||
+    rawQueryParam(req, ORIGIN_PARAM);
 
-  if (rawUrl) {
-    const target = parseTarget(rawUrl);
-    return target ? { target } : { error: 'forbidden' };
-  }
-
-  const base = parseTarget(readCookie(req, ORIGIN_COOKIE));
-  if (!base) return { error: 'landing' };
-
-  const rel = toRelativePath(requestPath(req));
+  const pathParam = requestPath(req);
   const search = forwardedSearch(req);
+  const requestHost = String((req.headers && req.headers.host) || '')
+    .split(':')[0]
+    .toLowerCase();
+
   let target;
-  try {
-    target = new URL(search ? `${rel}?${search}` : rel, base);
-  } catch {
-    return { error: 'landing' };
+  if (raw) {
+    const parsed = parseTarget(raw);
+    if (!parsed) return { error: 'forbidden' };
+    target = parsed.pathname === '/' && !parsed.search ? buildTarget(parsed, pathParam, search) : parsed;
+  } else {
+    const base = parseTarget(readCookie(req, ORIGIN_COOKIE));
+    if (!base) return { error: 'landing' };
+    target = buildTarget(base, pathParam, search);
   }
+
+  if (!target) return { error: 'forbidden' };
   if (!isAllowedHost(target.hostname)) return { error: 'forbidden' };
+  // Nunca contra el propio proxy (bucle infinito)
+  if (requestHost && target.hostname === requestHost) return { error: 'forbidden' };
   return { target };
+}
+
+/**
+ * Convierte una URL absoluta del origen en un enlace que se quede en el proxy:
+ *   https://apt.inled.es/ruta?x=1  ->  /ruta?__origin=https%3A%2F%2Fapt.inled.es&x=1
+ */
+function proxiedForm(origin, rest) {
+  let value = String(rest || '');
+  let hash = '';
+  const h = value.indexOf('#');
+  if (h >= 0) {
+    hash = value.slice(h);
+    value = value.slice(0, h);
+  }
+  let path = '/';
+  let search = '';
+  const q = value.indexOf('?');
+  if (q >= 0) {
+    path = value.slice(0, q);
+    search = value.slice(q + 1);
+  } else {
+    path = value;
+  }
+  if (!path) path = '/';
+  if (!path.startsWith('/')) path = '/' + path;
+  return `${path}?${ORIGIN_PARAM}=${encodeURIComponent(origin)}${search ? `&${search}` : ''}${hash}`;
+}
+
+/**
+ * Reescribe en HTML/CSS/JS todas las URLs absolutas hacia inled.es para que
+ * el navegador las pida al proxy en vez de ir directo al origen (que es lo
+ * que Cloudflare sigue desafiando con el User-Agent del navegador).
+ * Las relativas y las de terceros se tocan solo si aplica.
+ */
+function rewriteProxiedUrls(text) {
+  return text.replace(
+    /(?:(https?):)?\/\/((?:[a-z0-9-]+\.)*inled\.es)(?![a-z0-9.-])((?::\d+)?)((?:[^\s"'`<>\\)\]]*))/gi,
+    (match, scheme, host, port, rest) => {
+      if (!isAllowedHost(host)) return match;
+      const origin = `${(scheme || 'https').toLowerCase()}://${host}${port}`;
+      return proxiedForm(origin, rest || '');
+    }
+  );
+}
+
+/** La cookie del propio proxy no debe reenviarse al origen. */
+function stripOwnCookie(cookieHeader) {
+  if (!cookieHeader) return cookieHeader;
+  const kept = String(cookieHeader)
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part.split('=')[0].trim() !== ORIGIN_COOKIE);
+  return kept.length ? kept.join('; ') : '';
+}
+
+/**
+ * Cookies del origen: si apuntan a un dominio que el navegador rechazaría
+ * desde proxy.inled.es (p. ej. Domain=apt.inled.es, cf_clearance...), se quita
+ * el atributo Domain y queda host-only para el proxy.
+ */
+function normalizeSetCookie(cookie) {
+  const match = /;\s*domain=([^;]*)/i.exec(cookie);
+  if (!match) return cookie;
+  const domain = match[1].trim().replace(/^\./, '').toLowerCase();
+  if (domain === 'inled.es' || domain === 'proxy.inled.es') return cookie;
+  return cookie.replace(match[0], '');
+}
+
+/** ¿La respuesta es un desafío de Cloudflare que el navegador no puede completar? */
+function isCloudflareChallenge(response, payload) {
+  const mitigated = String(response.headers.get('cf-mitigated') || '').toLowerCase();
+  if (mitigated === 'challenge') return true;
+  if (response.status !== 403 && response.status !== 503) return false;
+  const server = String(response.headers.get('server') || '').toLowerCase();
+  if (!server.includes('cloudflare')) return false;
+  if (!payload || !payload.length) return false;
+  const head = payload.subarray(0, 8192).toString('utf8');
+  return /<title>Just a moment|cf-browser-verification|challenge-platform/i.test(head);
 }
 
 const CORS_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS';
@@ -229,6 +334,13 @@ function buildRequestHeaders(req, target) {
   // User-Agent propio del proxy: así se puede autorizar en Cloudflare y
   // esquivarle los desafíos (WAF / Bot Fight Mode).
   headers['user-agent'] = PROXY_USER_AGENT;
+
+  // Nuestra cookie de sesión no le interesa al origen
+  if (headers['cookie']) {
+    const withoutOurs = stripOwnCookie(headers['cookie']);
+    if (withoutOurs) headers['cookie'] = withoutOurs;
+    else delete headers['cookie'];
+  }
 
   // Evitamos compresión del origen: fetch() decodifica el cuerpo y reenviar
   // content-encoding original rompería la respuesta.
@@ -366,6 +478,29 @@ export default async function handler(req, res) {
       ? null
       : Buffer.from(await response.arrayBuffer());
 
+  // Desafío de Cloudflare: el navegador no puede completarlo a través del
+  // proxy (el challenge espera el host original), así que devolvemos una
+  // página de diagnóstico en vez de un "Just a moment" infinito.
+  if (isCloudflareChallenge(response, payload)) {
+    sendHtml(
+      res,
+      502,
+      renderChallenge({ host: target.host, url: target.toString(), country })
+    );
+    return;
+  }
+
+  // Reescribimos las URLs absolutas del origen (HTML/CSS/JS) para que el
+  // navegador las pida al proxy y no vuelva a salir con su propio User-Agent.
+  let outBody = payload;
+  const contentType = String(outHeaders['content-type'] || '');
+  if (outBody && REWRITABLE_TYPE.test(contentType) && outBody.length <= MAX_REWRITE_BYTES) {
+    const charset = /charset\s*=\s*"?([^";\s]+)/i.exec(contentType);
+    if (UTF8_CHARSET.test(charset ? charset[1].toLowerCase() : '')) {
+      outBody = Buffer.from(rewriteProxiedUrls(outBody.toString('utf8')), 'utf8');
+    }
+  }
+
   res.statusCode = status;
   for (const [name, value] of Object.entries(outHeaders)) {
     try {
@@ -375,8 +510,9 @@ export default async function handler(req, res) {
     }
   }
 
-  // Cookies del origen + la nuestra, que recuerda el origen de la sesión
-  const cookies = setCookies.slice();
+  // Cookies del origen (con Domain incompatible limpiado) + la nuestra,
+  // que recuerda el origen de la sesión
+  const cookies = setCookies.map(normalizeSetCookie);
   cookies.push(
     `${ORIGIN_COOKIE}=${encodeURIComponent(target.origin)}; Path=/; Max-Age=31536000; SameSite=Lax; Secure`
   );
@@ -389,11 +525,11 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Expose-Headers', '*');
   res.setHeader('X-Proxy-By', 'vercel-proxy-inled');
-  if (payload) res.setHeader('Content-Length', String(payload.length));
+  if (outBody) res.setHeader('Content-Length', String(outBody.length));
   else if (req.method === 'HEAD' && originContentLength) {
     res.setHeader('Content-Length', originContentLength);
   }
 
-  if (payload === null) res.end();
-  else res.end(payload);
+  if (outBody === null) res.end();
+  else res.end(outBody);
 }
