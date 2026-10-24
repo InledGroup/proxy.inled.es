@@ -39,6 +39,34 @@ formularios con URL relativa) resuelven su ruta contra ese origen:
 La ruta original la manda `vercel.json` a la función mediante el rewrite
 `/(.*)` → `/api/proxy?path=$1`.
 
+### User-Agent del proxy
+
+Todas las peticiones al origen salen identificadas con:
+
+```
+User-Agent: InledProxy/1.0
+```
+
+El `User-Agent` del cliente original no se reenvía (se sustituye por el del proxy).
+Para que Cloudflare no le ponga desafíos, crea una regla en el dominio de destino:
+
+*Security → WAF → Custom rules → Create rule*
+
+| Campo | Valor |
+|---|---|
+| Field | `User Agent` (`http.user_agent`) |
+| Operator | `equals` |
+| Value | `InledProxy/1.0` |
+| Action | `Skip` (o `Allow` si tu plan no tiene *Skip*) |
+
+En el *Skip* puedes marcar Managed Challenge, Rate limiting, Security Level, etc.
+Si usas **Bot Fight Mode** en plan gratuito, no se puede saltar con reglas: hay que
+desactivarlo para ese hostname (`Security → Bots → Bot Fight Mode`).
+
+> Un User-Agent se puede falsificar, así que esto es una comodidad de operación, no un
+> control de acceso. Si quieres blindar el origen de verdad, se puede añadir una cabecera
+> secreta (p. ej. `X-Inled-Token`) que el origen compruebe.
+
 ### Limitaciones conocidas
 
 - **No se reescribe el HTML**: los enlaces y recursos con URL **absoluta** al origen
@@ -109,6 +137,9 @@ curl -sI "https://proxy.inled.es/?url=https://evil.com/"
 curl -sI -H "Cookie: inled_proxy_origin=https%3A%2F%2Fapt.inled.es" \
   https://proxy.inled.es/css/site.css
 ```
+
+El `User-Agent: InledProxy/1.0` saliente se ve en los logs de Cloudflare del origen
+(`Security → Events`): si aparece ahí sin desafío, la regla funciona.
 
 > Nota: en producción Vercel sobreescribe `x-vercel-ip-country` con la IP real del
 > cliente, así que esa cabecera solo se puede forzar en local (`vercel dev` o `npm test`).

@@ -61,7 +61,8 @@ test('sin parámetro url ni cookie -> landing page', async () => {
   assert.equal(res.status, 200);
   assert.match(res.headers['content-type'], /text\/html/);
   assert.match(res.body, /Proxy inled/);
-  assert.match(res.body, /apt\.inled\.es/);
+  assert.match(res.body, /INLED/);
+  assert.match(res.body, /name="url"/);
 });
 
 test('403 si el destino no es inled.es', async () => {
@@ -109,7 +110,8 @@ test('proxy completo con ES: devuelve status, cabeceras y cuerpo', async () => {
 
     const seen = stub.calls[0];
     assert.equal(seen.init.headers['host'], 'apt.inled.es');
-    assert.equal(seen.init.headers['user-agent'], 'test-agent');
+    // El User-Agent del cliente se sustituye por el del proxy
+    assert.equal(seen.init.headers['user-agent'], 'InledProxy/1.0');
     assert.equal(seen.init.headers['x-forwarded-host'], 'proxy.inled.es');
     assert.equal(seen.init.headers['x-forwarded-proto'], 'https');
     assert.ok(seen.init.headers['x-forwarded-for'].includes('203.0.113.10'));

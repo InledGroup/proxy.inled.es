@@ -22,6 +22,9 @@ import { renderLanding } from '../lib/landing.js';
 
 const DOMAIN = 'inled.es';
 
+/** User-Agent con el que el proxy pide al origen (autorizable en Cloudflare). */
+const PROXY_USER_AGENT = 'InledProxy/1.0';
+
 /** Cookie que recuerda el origen de la sesión proxificada. */
 const ORIGIN_COOKIE = 'inled_proxy_origin';
 
@@ -222,6 +225,10 @@ function buildRequestHeaders(req, target) {
     (req.headers['x-forwarded-for'] ? String(req.headers['x-forwarded-for']) + ', ' : '') +
     (req.headers['x-real-ip'] || req.ip || '');
   if (req.headers['x-real-ip']) headers['x-real-ip'] = String(req.headers['x-real-ip']);
+
+  // User-Agent propio del proxy: así se puede autorizar en Cloudflare y
+  // esquivarle los desafíos (WAF / Bot Fight Mode).
+  headers['user-agent'] = PROXY_USER_AGENT;
 
   // Evitamos compresión del origen: fetch() decodifica el cuerpo y reenviar
   // content-encoding original rompería la respuesta.

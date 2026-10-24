@@ -87,6 +87,7 @@ test('landing: sin ?url= ni cookie devuelve la página de uso', async () => {
   const html = await res.text();
   assert.match(html, /Proxy inled/);
   assert.match(html, /name="url"/);
+  assert.match(html, /Licenciado bajo MIT-INLED/);
   assert.equal(originRequests.length, 0, 'no debe tocar el origen');
 });
 
@@ -105,7 +106,7 @@ test('proxy end-to-end: devuelve status, cabeceras y cuerpo del origen', async (
   // La petición llegó al origen con el Host correcto y los encadenados de Vercel
   const seen = originRequests.at(-1);
   assert.equal(seen.headers.host, `127.0.0.1:${ORIGIN_PORT}`);
-  assert.equal(seen.headers['user-agent'], 'e2e-agent');
+  assert.equal(seen.headers['user-agent'], 'InledProxy/1.0');
   assert.equal(seen.headers['x-forwarded-host'], 'proxy.inled.es');
   assert.equal(seen.headers['x-forwarded-proto'], 'https');
   assert.ok(seen.headers['x-forwarded-for'].includes('198.51.100.7'));
