@@ -411,8 +411,8 @@ export default async function handler(req, res) {
   }
 
   if (resolved.error) {
-    // Nada que proxificar -> landing con instrucciones de uso
-    sendHtml(res, 200, renderLanding({ country }));
+    // Nada que proxificar -> landing con el formulario de uso
+    sendHtml(res, 200, renderLanding());
     return;
   }
 
@@ -478,15 +478,10 @@ export default async function handler(req, res) {
       ? null
       : Buffer.from(await response.arrayBuffer());
 
-  // Desafío de Cloudflare: el navegador no puede completarlo a través del
-  // proxy (el challenge espera el host original), así que devolvemos una
-  // página de diagnóstico en vez de un "Just a moment" infinito.
+  // Desafío o error del origen: el navegador no puede resolverlo a través
+  // del proxy, así que devolvemos un aviso genérico en vez de un bucle.
   if (isCloudflareChallenge(response, payload)) {
-    sendHtml(
-      res,
-      502,
-      renderChallenge({ host: target.host, url: target.toString(), country })
-    );
+    sendHtml(res, 502, renderChallenge({ host: target.host, url: target.toString() }));
     return;
   }
 

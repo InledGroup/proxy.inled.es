@@ -63,6 +63,9 @@ test('sin parámetro url ni cookie -> landing page', async () => {
   assert.match(res.body, /Proxy inled/);
   assert.match(res.body, /INLED/);
   assert.match(res.body, /name="url"/);
+  // La landing no explica nada interno: solo input y formato
+  assert.ok(!/InledProxy|User-Agent|Cloudflare|WAF|cookie|país/i.test(res.body), res.body);
+  assert.match(res.body, /\?url=https:\/\/apt\.inled\.es/);
 });
 
 test('403 si el destino no es inled.es', async () => {
@@ -452,11 +455,12 @@ test('desafío de Cloudflare -> página de diagnóstico, no bucle infinito', asy
         headers: { 'x-vercel-ip-country': 'ES' },
       })
     );
-    assert.equal(res.status, 502);
-    assert.match(res.headers['content-type'], /text\/html/);
-    assert.match(res.body, /Desafío de Cloudflare/);
-    assert.match(res.body, /InledProxy\/1\.0/);
-    assert.ok(res.body.includes('/?url=' + encodeURIComponent('https://apt.inled.es/app')));
+  assert.equal(res.status, 502);
+  assert.match(res.headers['content-type'], /text\/html/);
+  assert.match(res.body, /No se ha podido cargar la página/);
+  // Nada de detalles internos en el front
+  assert.ok(!/InledProxy|User-Agent|Cloudflare|WAF|desafío/i.test(res.body), res.body);
+  assert.ok(res.body.includes('/?url=' + encodeURIComponent('https://apt.inled.es/app')));
   } finally {
     stub.restore();
   }
